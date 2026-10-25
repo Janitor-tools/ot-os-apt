@@ -1,0 +1,144 @@
+# -----------------------------------------------------------------------------
+# Publish the OT-OS APT repository to GitHub Pages
+#
+# Decisions Q11/Q12 (ot-linux docs/decisions.md, 2026-10-25):
+#   * Janitor-tools/ot-linux (private) builds and tests UNSIGNED packages and
+#     sends a repository_dispatch with the id of its Actions run.
+#   * This workflow downloads that run's "ot-os-packages" artefact, merges it
+#     into the live repository (scripts/update-repo.sh), signs with the
+#     archive SUBKEY and deploys the whole site to Pages.
+#   * The signing key exists ONLY in this repository's "apt-publish"
+#     environment. The build repository never sees it.
+#
+# One-time setup (repository settings):
+#   Pages:  Source = "GitHub Actions"
+#   Environment "apt-publish" (deployment branches: main only):
+#     secret   APT_SIGNING_KEY          armored export of the signing subkey only
+#     secret   APT_SIGNING_PASSPHRASE   its (CI-only) passphrase
+#     secret   OT_LINUX_ARTIFACT_TOKEN  fine-grained PAT, repository
+#                                       Janitor-tools/ot-linux, "Actions: Read-only"
+#     variable APT_SIGNING_SUBKEY_FPR   0A404294B6626C581838C1DE9F1692FF20432DE1
+#
+# Manual runs (Actions -> publish -> Run workflow):
+#   * first deploy:  bootstrap = true, run_id empty  -> empty, signed suites
+#   * re-sign only:  run_id empty                    -> same packages, new signature
+#   * replay a build: run_id = <ot-linux run id>, suite = ...
+# -----------------------------------------------------------------------------
+name: publish
+
+on:
+  repository_dispatch:
+    types: [ot-os-packages]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ot-linux Actions run id holding the ot-os-packages artefact (empty = republish/re-sign only)'
+        required: false
+        default: ''
+      suite:
+        description: 'Target suite for the packages'
+        type: choice
+        options: [noble-nightly, noble]
+        default: noble-nightly
+      bootstrap:
+        description: 'First deploy: allow publishing while no suite exists yet'
+        type: boolean
+        default: false
+
+# Every run rebuilds the site from the live one: runs must never overlap,
+# and none may be cancelled half-way (a queued run picks up the result).
+concurrency:
+  group: apt-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SITE_URL: https://janitor-tools.github.io/ot-os-apt/
+  ARCHIVE_FPR: 59E101484CB33F6BE34AEE659D666CB93A415504
+
+jobs:
+  assemble:
+    runs-on: ubuntu-24.04
+    environment: apt-publish
+    env:
+      # Untrusted input (dispatch payload / form) only ever reaches the shell
+      # through environment variables, and is validated before use.
+      RUN_ID: ${{ github.event.client_payload.run_id || inputs.run_id }}
+      SUITE: ${{ github.event.client_payload.suite || inputs.suite }}
+      SOURCE_SHA: ${{ github.event.client_payload.sha }}
+      BOOTSTRAP: ${{ inputs.bootstrap && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          [[ -z "${RUN_ID}" || "${RUN_ID}" =~ ^[0-9]+$ ]] || { echo "::error::invalid run_id"; exit 1; }
+          [[ "${SUITE}" == noble || "${SUITE}" == noble-nightly ]] || { echo "::error::invalid suite '${SUITE}'"; exit 1; }
+          echo "run_id=${RUN_ID:-<none>} suite=${SUITE} sha=${SOURCE_SHA:-<n/a>} bootstrap=${BOOTSTRAP}"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends apt-utils dpkg-dev gnupg xz-utils
+
+      - name: Download packages from ot-linux
+        if: env.RUN_ID != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ot-os-packages
+          path: ${{ runner.temp }}/incoming
+          repository: Janitor-tools/ot-linux
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ secrets.OT_LINUX_ARTIFACT_TOKEN }}
+
+      - name: Import signing subkey
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+          SUBKEY_FPR: ${{ vars.APT_SIGNING_SUBKEY_FPR }}
+        run: |
+          [[ -n "${APT_SIGNING_KEY}" && -n "${APT_SIGNING_PASSPHRASE}" && -n "${SUBKEY_FPR}" ]] \
+            || { echo "::error::apt-publish environment is missing APT_SIGNING_KEY / APT_SIGNING_PASSPHRASE / APT_SIGNING_SUBKEY_FPR"; exit 1; }
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          install -d -m 0700 "${GNUPGHOME}"
+          printf '%s\n' "${APT_SIGNING_KEY}" | gpg --batch --import
+          install -m 0600 /dev/null "${RUNNER_TEMP}/passphrase"
+          printf '%s' "${APT_SIGNING_PASSPHRASE}" > "${RUNNER_TEMP}/passphrase"
+          # The primary secret key must NOT be here: "sec#" = stub only.
+          gpg --batch --with-colons --list-secret-keys "${ARCHIVE_FPR}" | awk -F: '$1=="sec" && $15 !~ /^#/ {bad=1} END {exit bad}' \
+            || { echo "::error::APT_SIGNING_KEY contains the PRIMARY secret key - export only the subkey"; exit 1; }
+          echo "GNUPGHOME=${GNUPGHOME}" >> "$GITHUB_ENV"
+
+      - name: Assemble, prune and sign the repository
+        env:
+          OUT: ${{ runner.temp }}/site
+          KEYRING_ASC: keys/ot-os-archive-keyring.asc
+          SIGNING_SUBKEY_FPR: ${{ vars.APT_SIGNING_SUBKEY_FPR }}
+          PASSPHRASE_FILE: ${{ runner.temp }}/passphrase
+          INCOMING: ${{ env.RUN_ID != '' && format('{0}/incoming', runner.temp) || '' }}
+          TARGET_SUITE: ${{ env.SUITE }}
+          ALLOW_BOOTSTRAP: ${{ env.BOOTSTRAP }}
+        run: bash scripts/update-repo.sh
+
+      - name: Remove key material
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/gnupg" "${RUNNER_TEMP}/passphrase"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    needs: assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

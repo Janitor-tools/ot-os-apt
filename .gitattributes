@@ -1,0 +1,5 @@
+# Everything here runs on Linux (GitHub Actions): force LF.
+*       text=auto eol=lf
+*.asc   text eol=lf
+*.gpg   binary
+*.deb   binary

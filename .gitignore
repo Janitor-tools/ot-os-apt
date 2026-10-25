@@ -1,0 +1,9 @@
+# Built sites and packages never live in git: the published Pages site is the
+# source of truth (see scripts/update-repo.sh).
+/_site/
+*.deb
+# Signing material must never land in git.
+*.key
+*.sec
+*.rev
+secring.*
